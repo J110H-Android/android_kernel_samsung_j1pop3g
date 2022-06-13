@@ -22,6 +22,7 @@
 #include <linux/init.h>
 #include <linux/skbuff.h>
 #include <linux/percpu.h>
+#include <linux/list.h>
 #include <net/sock.h>
 #include <linux/un.h>
 #include <net/af_unix.h>
@@ -185,7 +186,6 @@ void __init avc_init(void)
 
 	avc_node_cachep = kmem_cache_create("avc_node", sizeof(struct avc_node),
 					     0, SLAB_PANIC, NULL);
-
 	avc_operation_node_cachep = kmem_cache_create("avc_operation_node",
 				sizeof(struct avc_operation_node),
 				0, SLAB_PANIC, NULL);
@@ -238,7 +238,6 @@ static struct operation_decision *avc_operation_lookup(u8 type,
 					struct avc_operation_node *ops_node)
 {
 	struct avc_operation_decision_node *od_node;
-	avc_operation_free(node->ae.ops_node);
 	struct operation_decision *od = NULL;
 
 	list_for_each_entry(od_node, &ops_node->od_head, od_list) {
@@ -299,7 +298,7 @@ static void avc_operation_decision_free(
 
 static void avc_operation_free(struct avc_operation_node *ops_node)
 {
-	struct avc_operation_decision_node *od_node, *del;
+	struct avc_operation_decision_node *od_node, *tmp;
 
 	if (!ops_node)
 		return;
@@ -495,6 +494,7 @@ static inline int avc_operation_audit(u32 ssid, u32 tsid, u16 tclass,
 static void avc_node_free(struct rcu_head *rhead)
 {
 	struct avc_node *node = container_of(rhead, struct avc_node, rhead);
+	avc_operation_free(node->ae.ops_node);
 	kmem_cache_free(avc_node_cachep, node);
 	avc_cache_stats_incr(frees);
 }
@@ -686,14 +686,14 @@ static struct avc_node *avc_insert(u32 ssid, u32 tsid, u16 tclass,
 
 		hvalue = avc_hash(ssid, tsid, tclass);
 		avc_node_populate(node, ssid, tsid, tclass, avd);
-
-		head = &avc_cache.slots[hvalue];
-		lock = &avc_cache.slots_lock[hvalue];
 		rc = avc_operation_populate(node, ops_node);
 		if (rc) {
 			kmem_cache_free(avc_node_cachep, node);
 			return NULL;
 		}
+		head = &avc_cache.slots[hvalue];
+		lock = &avc_cache.slots_lock[hvalue];
+
 		spin_lock_irqsave(lock, flag);
 		hlist_for_each_entry(pos, head, list) {
 			if (pos->ae.ssid == ssid &&
@@ -740,11 +740,15 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
 	avc_dump_query(ab, ad->selinux_audit_data->ssid,
 			   ad->selinux_audit_data->tsid,
 			   ad->selinux_audit_data->tclass);
+	if (ad->selinux_audit_data->denied) {
+		audit_log_format(ab, " permissive=%u",
+				 ad->selinux_audit_data->result ? 0 : 1);
+	}
 }
 
 /* This is the slow part of avc audit with big stack footprint */
 noinline int slow_avc_audit(u32 ssid, u32 tsid, u16 tclass,
-		u32 requested, u32 audited, u32 denied,
+		u32 requested, u32 audited, u32 denied, int result,
 		struct common_audit_data *a,
 		unsigned flags)
 {
@@ -773,6 +777,7 @@ noinline int slow_avc_audit(u32 ssid, u32 tsid, u16 tclass,
 	sad.tsid = tsid;
 	sad.audited = audited;
 	sad.denied = denied;
+	sad.result = result;
 
 	a->selinux_audit_data = &sad;
 
@@ -819,6 +824,7 @@ static inline int avc_sidcmp(u32 x, u32 y)
  * @perms : Permission mask bits
  * @ssid,@tsid,@tclass : identifier of an AVC entry
  * @seqno : sequence number when decision was made
+ * @od: operation_decision to be added to the node
  *
  * if a valid AVC entry doesn't exist,this function returns -ENOENT.
  * if kmalloc() called internal returns NULL, this function returns -ENOMEM.
@@ -993,8 +999,11 @@ static noinline int avc_denied(u32 ssid, u32 tsid,
 {
 	if (flags & AVC_STRICT)
 		return -EACCES;
-
+#ifdef CONFIG_ALWAYS_ENFORCE
+	if (!(avd->flags & AVD_FLAGS_PERMISSIVE))
+#else
 	if (selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE))
+#endif
 		return -EACCES;
 
 	avc_update_node(AVC_CALLBACK_GRANT, requested, cmd, ssid,
@@ -1110,8 +1119,8 @@ inline int avc_has_perm_noaudit(u32 ssid, u32 tsid,
 			 struct av_decision *avd)
 {
 	struct avc_node *node;
-	int rc = 0;
 	struct avc_operation_node ops_node;
+	int rc = 0;
 	u32 denied;
 
 	BUG_ON(!requested);
