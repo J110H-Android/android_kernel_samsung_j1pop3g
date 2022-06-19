@@ -76,5 +76,3 @@ obj-$(CONFIG_SDIODEV)     += sdiodev/
 obj-$(CONFIG_MDBG)  += mdbg/
 obj-y   += sprd_dwnload/
 obj-y   += sprd_wcn/
-obj-$(CONFIG_UID_CPUTIME) += uid_cputime.o
-
